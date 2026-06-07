@@ -40,7 +40,10 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: DetourFlow-${{ github.ref_name }}-win-x64.zip
+          files: |
+            DetourFlow-${{ github.ref_name }}-win-x64.zip
+            build/Release/DetourLauncher.exe
+            build/Release/DetourFlow.dll
           name: Release ${{ github.ref_name }}
           draft: false
           prerelease: false
