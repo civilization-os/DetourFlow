@@ -1,0 +1,5 @@
+build/
+detour_flow_*.log
+.vs/
+*.user
+*.suo
