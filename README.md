@@ -13,6 +13,8 @@ Leveraging the **Microsoft Detours** library, it injects a custom DLL into targe
 👉 **[中文版使用说明 (Chinese Version)](#-中文使用说明)**
 ---
 
+![Screenshot of DetourFlow in Action](preview.png)
+
 ## ✨ Features
 
 - 🎯 **Process-Level Sandbox Isolation**: No TUN/TAP virtual network adapters or global routing changes required. Interception is strictly confined to the targeted process and its descendants.
