@@ -1,0 +1,48 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and Release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build Project
+        run: cmake --build build --config Release
+
+      - name: Prepare Release Package
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path release-pkg
+          Copy-Item build\Release\DetourFlow.dll release-pkg\
+          Copy-Item build\Release\DetourLauncher.exe release-pkg\
+          Copy-Item README.md release-pkg\
+          Compress-Archive -Path release-pkg\* -DestinationPath DetourFlow-${{ github.ref_name }}-win-x64.zip -Force
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: DetourFlow-${{ github.ref_name }}-win-x64.zip
+          name: Release ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
