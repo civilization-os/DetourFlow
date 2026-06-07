@@ -60,9 +60,22 @@ void Log(const char* format, ...) {
 
     OutputDebugStringA(buffer);
 
-    // Append to process-specific log file in a fixed directory to avoid cluttering app folders
-    char filename[512];
-    sprintf_s(filename, "C:\\Users\\14724\\.gemini\\antigravity\\pCheck\\DetourFlow\\detour_flow_%u.log", GetCurrentProcessId());
+    // Append to process-specific log file in the same directory as the DLL to avoid cluttering app folders and hardcoding paths
+    char filename[MAX_PATH] = { 0 };
+    wchar_t dllPathW[MAX_PATH];
+    if (GetModuleFileNameW(GetModuleHandleA("DetourFlow.dll"), dllPathW, MAX_PATH) > 0) {
+        std::wstring dllDir = dllPathW;
+        size_t lastSlash = dllDir.find_last_of(L"\\/");
+        if (lastSlash != std::wstring::npos) {
+            dllDir = dllDir.substr(0, lastSlash);
+        }
+        char dllDirA[MAX_PATH];
+        WideCharToMultiByte(CP_UTF8, 0, dllDir.c_str(), -1, dllDirA, MAX_PATH, NULL, NULL);
+        sprintf_s(filename, "%s\\detour_flow_%u.log", dllDirA, GetCurrentProcessId());
+    } else {
+        sprintf_s(filename, "detour_flow_%u.log", GetCurrentProcessId());
+    }
+
     FILE* f = nullptr;
     if (fopen_s(&f, filename, "a") == 0 && f) {
         SYSTEMTIME st;
