@@ -1,0 +1,64 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "gui",
+  "version": "0.1.0",
+  "identifier": "com.tauri-app.gui",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "DetourFlow 控制台",
+        "width": 900,
+        "height": 800,
+        "decorations": false,
+        "transparent": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  },
+  "plugins": {
+    "cli": {
+      "description": "DetourFlow 命令行代理工具",
+      "args": [
+        {
+          "name": "path",
+          "index": 1,
+          "description": "要代理拉起的可执行文件绝对路径",
+          "takesValue": true
+        },
+        {
+          "name": "proxy",
+          "short": "p",
+          "long": "proxy",
+          "description": "SOCKS5代理端口 (如 7897)",
+          "takesValue": true
+        },
+        {
+          "name": "bypass",
+          "short": "b",
+          "long": "bypass",
+          "description": "IP直连白名单，逗号分隔 (如 8.8.8.8,114.114.114.114)",
+          "takesValue": true
+        }
+      ]
+    }
+  }
+}

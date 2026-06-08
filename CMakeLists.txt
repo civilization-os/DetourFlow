@@ -29,3 +29,13 @@ add_executable(DetourLauncher
     DetourLauncher.cpp
 )
 target_link_libraries(DetourLauncher PRIVATE detours)
+
+# Change output directory to avoid locking issues with active DLL
+set_target_properties(DetourFlow PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release_new"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release_new"
+)
+set_target_properties(DetourLauncher PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release_new"
+)
+

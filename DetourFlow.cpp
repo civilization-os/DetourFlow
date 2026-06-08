@@ -215,6 +215,95 @@ bool ParseTargetAddress(const sockaddr* name, ConnectTarget& target) {
             return false;
         }
 
+        // Check against custom IP bypass whitelist (check detour_bypass.txt dynamically to support hot-reloading)
+        std::vector<uint32_t> bypassIps;
+        bool loadedFromFile = false;
+
+        // Try reading detour_bypass.txt from DLL directory
+        char dllPath[MAX_PATH] = { 0 };
+        if (GetModuleFileNameA(GetModuleHandleA("DetourFlow.dll"), dllPath, MAX_PATH) > 0) {
+            std::string dllDir = dllPath;
+            size_t lastSlash = dllDir.find_last_of("\\/");
+            if (lastSlash != std::string::npos) {
+                dllDir = dllDir.substr(0, lastSlash);
+            }
+            std::string bypassPath = dllDir + "\\detour_bypass.txt";
+            FILE* f = nullptr;
+            if (fopen_s(&f, bypassPath.c_str(), "r") == 0 && f) {
+                char fileContent[4096] = { 0 };
+                size_t readBytes = fread(fileContent, 1, sizeof(fileContent) - 1, f);
+                fclose(f);
+                if (readBytes > 0) {
+                    std::string s(fileContent);
+                    size_t start = 0;
+                    size_t end = s.find(',');
+                    while (end != std::string::npos) {
+                        std::string ipStr = s.substr(start, end - start);
+                        ipStr.erase(0, ipStr.find_first_not_of(" \t\r\n"));
+                        ipStr.erase(ipStr.find_last_not_of(" \t\r\n") + 1);
+                        if (!ipStr.empty()) {
+                            IN_ADDR addr;
+                            if (inet_pton(AF_INET, ipStr.c_str(), &addr) == 1) {
+                                bypassIps.push_back(ntohl(addr.s_addr));
+                            }
+                        }
+                        start = end + 1;
+                        end = s.find(',', start);
+                    }
+                    std::string ipStr = s.substr(start);
+                    ipStr.erase(0, ipStr.find_first_not_of(" \t\r\n"));
+                    ipStr.erase(ipStr.find_last_not_of(" \t\r\n") + 1);
+                    if (!ipStr.empty()) {
+                        IN_ADDR addr;
+                        if (inet_pton(AF_INET, ipStr.c_str(), &addr) == 1) {
+                            bypassIps.push_back(ntohl(addr.s_addr));
+                        }
+                    }
+                    loadedFromFile = true;
+                }
+            }
+        }
+
+        // Fallback to environment variable if file load failed or empty
+        if (!loadedFromFile) {
+            char envBypass[4096];
+            size_t envBypassLen = 0;
+            if (getenv_s(&envBypassLen, envBypass, sizeof(envBypass), "DETOUR_BYPASS_IPS") == 0 && envBypassLen > 0) {
+                std::string s(envBypass);
+                size_t start = 0;
+                size_t end = s.find(',');
+                while (end != std::string::npos) {
+                    std::string ipStr = s.substr(start, end - start);
+                    ipStr.erase(0, ipStr.find_first_not_of(" \t\r\n"));
+                    ipStr.erase(ipStr.find_last_not_of(" \t\r\n") + 1);
+                    if (!ipStr.empty()) {
+                        IN_ADDR addr;
+                        if (inet_pton(AF_INET, ipStr.c_str(), &addr) == 1) {
+                            bypassIps.push_back(ntohl(addr.s_addr));
+                        }
+                    }
+                    start = end + 1;
+                    end = s.find(',', start);
+                }
+                std::string ipStr = s.substr(start);
+                ipStr.erase(0, ipStr.find_first_not_of(" \t\r\n"));
+                ipStr.erase(ipStr.find_last_not_of(" \t\r\n") + 1);
+                if (!ipStr.empty()) {
+                    IN_ADDR addr;
+                    if (inet_pton(AF_INET, ipStr.c_str(), &addr) == 1) {
+                        bypassIps.push_back(ntohl(addr.s_addr));
+                    }
+                }
+            }
+        }
+
+        for (uint32_t bypassIp : bypassIps) {
+            if (ip == bypassIp) {
+                Log("DIRECT Whitelist Bypass connect to %u.%u.%u.%u:%u", (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF, port);
+                return false;
+            }
+        }
+
         return true; 
     } else if (name->sa_family == AF_INET6) {
         // Direct route (bypass proxy) for raw IPv6 destinations.
@@ -852,17 +941,42 @@ BOOL WINAPI HookCreateProcessW(
     }
     Log("Intercepted CreateProcessW. Target command: %ws", cmd.c_str());
 
+    std::wstring cmdStr = lpCommandLine ? lpCommandLine : L"";
+    std::wstring appStr = lpApplicationName ? lpApplicationName : L"";
+    
+    // Check if the spawned process is a build tool, compiler, or version control tool
+    bool isBuildTool = false;
+    const wchar_t* buildTools[] = {
+        L"cargo.exe", L"rustc.exe", L"git.exe", L"cl.exe", L"link.exe", 
+        L"msbuild.exe", L"cmake.exe", L"ninja.exe", L"tar.exe", L"powershell.exe"
+    };
+    for (const wchar_t* tool : buildTools) {
+        if (cmdStr.find(tool) != std::wstring::npos || appStr.find(tool) != std::wstring::npos) {
+            isBuildTool = true;
+            break;
+        }
+    }
+
+    if (isBuildTool) {
+        Log("Bypassing DetourFlow.dll injection for build tool to prevent locks/network errors.");
+        return TrueCreateProcessW(
+            lpApplicationName,
+            lpCommandLine,
+            lpProcessAttributes,
+            lpThreadAttributes,
+            bInheritHandles,
+            dwCreationFlags,
+            lpEnvironment,
+            lpCurrentDirectory,
+            lpStartupInfo,
+            lpProcessInformation
+        );
+    }
+
     std::wstring modifiedCmdLine;
     LPWSTR targetCmdLine = lpCommandLine;
     if (lpCommandLine) {
-        std::wstring cmdStr(lpCommandLine);
-        bool isChrome = (cmdStr.find(L"chrome.exe") != std::wstring::npos);
-        if (!isChrome && lpApplicationName) {
-            std::wstring appStr(lpApplicationName);
-            if (appStr.find(L"chrome.exe") != std::wstring::npos) {
-                isChrome = true;
-            }
-        }
+        bool isChrome = (cmdStr.find(L"chrome.exe") != std::wstring::npos || appStr.find(L"chrome.exe") != std::wstring::npos);
         if (isChrome && cmdStr.find(L"--no-sandbox") == std::wstring::npos) {
             modifiedCmdLine = cmdStr + L" --no-sandbox";
             targetCmdLine = &modifiedCmdLine[0];
@@ -917,17 +1031,42 @@ BOOL WINAPI HookCreateProcessA(
     }
     Log("Intercepted CreateProcessA. Target command: %s", cmd.c_str());
 
+    std::string cmdStr = lpCommandLine ? lpCommandLine : "";
+    std::string appStr = lpApplicationName ? lpApplicationName : "";
+
+    // Check if the spawned process is a build tool, compiler, or version control tool
+    bool isBuildTool = false;
+    const char* buildTools[] = {
+        "cargo.exe", "rustc.exe", "git.exe", "cl.exe", "link.exe", 
+        "msbuild.exe", "cmake.exe", "ninja.exe", "tar.exe", "powershell.exe"
+    };
+    for (const char* tool : buildTools) {
+        if (cmdStr.find(tool) != std::string::npos || appStr.find(tool) != std::string::npos) {
+            isBuildTool = true;
+            break;
+        }
+    }
+
+    if (isBuildTool) {
+        Log("Bypassing DetourFlow.dll injection for build tool (A) to prevent locks/network errors.");
+        return TrueCreateProcessA(
+            lpApplicationName,
+            lpCommandLine,
+            lpProcessAttributes,
+            lpThreadAttributes,
+            bInheritHandles,
+            dwCreationFlags,
+            lpEnvironment,
+            lpCurrentDirectory,
+            lpStartupInfo,
+            lpProcessInformation
+        );
+    }
+
     std::string modifiedCmdLine;
     LPSTR targetCmdLine = lpCommandLine;
     if (lpCommandLine) {
-        std::string cmdStr(lpCommandLine);
-        bool isChrome = (cmdStr.find("chrome.exe") != std::string::npos);
-        if (!isChrome && lpApplicationName) {
-            std::string appStr(lpApplicationName);
-            if (appStr.find("chrome.exe") != std::string::npos) {
-                isChrome = true;
-            }
-        }
+        bool isChrome = (cmdStr.find("chrome.exe") != std::string::npos || appStr.find("chrome.exe") != std::string::npos);
         if (isChrome && cmdStr.find("--no-sandbox") == std::string::npos) {
             modifiedCmdLine = cmdStr + " --no-sandbox";
             targetCmdLine = &modifiedCmdLine[0];
@@ -1011,6 +1150,28 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     }
 
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
+        wchar_t exePathW[MAX_PATH] = { 0 };
+        GetModuleFileNameW(NULL, exePathW, MAX_PATH);
+        std::wstring exeStr(exePathW);
+
+        bool isBuildTool = false;
+        const wchar_t* buildTools[] = {
+            L"cargo.exe", L"rustc.exe", L"git.exe", L"cl.exe", L"link.exe", 
+            L"msbuild.exe", L"cmake.exe", L"ninja.exe", L"tar.exe", L"powershell.exe"
+        };
+        for (const wchar_t* tool : buildTools) {
+            if (exeStr.find(tool) != std::wstring::npos) {
+                isBuildTool = true;
+                break;
+            }
+        }
+
+        if (isBuildTool) {
+            Log("DetourFlow DLL Loaded inside build tool %ws. Bypassing all hooks.", exeStr.c_str());
+            DetourRestoreAfterWith();
+            return TRUE;
+        }
+
         SetEnvironmentVariableA("no_proxy", "localhost,127.0.0.1,::1");
         SetEnvironmentVariableA("NO_PROXY", "localhost,127.0.0.1,::1");
         Log("DetourFlow DLL Loaded inside process. Set local bypass env (no_proxy/NO_PROXY).");

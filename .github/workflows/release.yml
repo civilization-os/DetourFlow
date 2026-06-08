@@ -19,21 +19,53 @@ jobs:
         with:
           submodules: recursive
 
+      # ── C++ 部分：编译 DetourFlow.dll + DetourLauncher.exe ──────────────
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
 
       - name: Configure CMake
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release
 
-      - name: Build Project
+      - name: Build C++ Project
         run: cmake --build build --config Release
 
-      - name: Prepare Release Package
+      # ── GUI 部分：编译 Tauri 桌面应用 ────────────────────────────────────
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './gui/src-tauri -> target'
+
+      - name: Install frontend dependencies
+        run: npm install
+        working-directory: gui
+
+      - name: Build Tauri GUI (NSIS installer + portable)
+        run: npm run tauri build
+        working-directory: gui
+        env:
+          # 让 tauri build 时能找到已编译好的 C++ 产物
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+
+      # ── 打包发布 ─────────────────────────────────────────────────────────
+      - name: Prepare Release Package (portable zip)
         shell: powershell
         run: |
           New-Item -ItemType Directory -Force -Path release-pkg
+          # C++ 核心
           Copy-Item build\Release\DetourFlow.dll release-pkg\
           Copy-Item build\Release\DetourLauncher.exe release-pkg\
+          # GUI exe（便携版，不需要安装）
+          $guiExe = Get-ChildItem "gui\src-tauri\target\release\gui.exe" -ErrorAction SilentlyContinue
+          if ($guiExe) { Copy-Item $guiExe.FullName release-pkg\DetourFlow.exe }
           Copy-Item README.md release-pkg\
           Compress-Archive -Path release-pkg\* -DestinationPath DetourFlow-${{ github.ref_name }}-win-x64.zip -Force
 
@@ -44,6 +76,7 @@ jobs:
             DetourFlow-${{ github.ref_name }}-win-x64.zip
             build/Release/DetourLauncher.exe
             build/Release/DetourFlow.dll
+            gui/src-tauri/target/release/bundle/nsis/*.exe
           name: Release ${{ github.ref_name }}
           draft: false
           prerelease: false
