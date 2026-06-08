@@ -47,14 +47,12 @@
         {
           "name": "proxy",
           "short": "p",
-          "long": "proxy",
           "description": "SOCKS5代理端口 (如 7897)",
           "takesValue": true
         },
         {
           "name": "bypass",
           "short": "b",
-          "long": "bypass",
           "description": "IP直连白名单，逗号分隔 (如 8.8.8.8,114.114.114.114)",
           "takesValue": true
         }
