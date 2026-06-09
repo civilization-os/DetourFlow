@@ -11,6 +11,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getMatches } from "@tauri-apps/plugin-cli";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 
 function App() {
@@ -19,6 +20,14 @@ function App() {
   const [proxyHost, setProxyHost] = useState("127.0.0.1");
   const [proxyPort, setProxyPort] = useState("7897");
   const [bypassIps, setBypassIps] = useState("8.8.8.8, 114.114.114.114");
+
+  const proxyHostRef = useRef(proxyHost);
+  const proxyPortRef = useRef(proxyPort);
+  const bypassIpsRef = useRef(bypassIps);
+
+  useEffect(() => { proxyHostRef.current = proxyHost; }, [proxyHost]);
+  useEffect(() => { proxyPortRef.current = proxyPort; }, [proxyPort]);
+  useEffect(() => { bypassIpsRef.current = bypassIps; }, [bypassIps]);
 
   // 已代理应用列表
   const [apps, setApps] = useState([]);
@@ -157,9 +166,68 @@ function App() {
 
     parseCliArgs();
 
+    let unlistenDrag = null;
+    const startDragListen = async () => {
+      unlistenDrag = await listen("tauri://drag-drop", async (event) => {
+        const paths = Array.isArray(event.payload) ? event.payload : (event.payload?.paths || []);
+        if (paths && paths.length > 0) {
+          const path = paths[0];
+          const isExe = path.toLowerCase().endsWith(".exe");
+          const isLnk = path.toLowerCase().endsWith(".lnk");
+          if (isExe || isLnk) {
+            const appName = path.split(/[\\/]/).pop().replace(/\.(exe|lnk)$/i, "") || "拖入应用";
+            try {
+              setLogs(prev => [
+                ...prev,
+                { time: getCurrentTime(), type: "system", text: `[控制台] 拖入文件成功，正在以代理模式拉起: ${appName}...` }
+              ]);
+
+              const pid = await invoke("launch_app", {
+                path,
+                proxyHost: proxyHostRef.current,
+                proxyPort: proxyPortRef.current,
+                bypassIps: bypassIpsRef.current
+              });
+
+              const newApp = {
+                id: Date.now(),
+                name: appName,
+                path: path,
+                pid: pid,
+                streams: 0,
+                active: true
+              };
+
+              setApps(prev => [...prev, newApp]);
+              setSelectedAppId(newApp.id);
+              setLogs(prev => [
+                ...prev,
+                { time: getCurrentTime(), type: "system", text: `[控制台] 应用已启动！分配进程 PID: ${pid}` }
+              ]);
+            } catch (err) {
+              setLogs(prev => [
+                ...prev,
+                { time: getCurrentTime(), type: "error", text: `[错误] 启动拖入的程序失败: ${err}` }
+              ]);
+            }
+          } else {
+            setLogs(prev => [
+              ...prev,
+              { time: getCurrentTime(), type: "error", text: `[系统] 只支持拖入 .exe 或快捷方式 .lnk 文件！` }
+            ]);
+          }
+        }
+      });
+    };
+
+    startDragListen();
+
     return () => {
       if (unlisten) {
         unlisten().then(() => {});
+      }
+      if (unlistenDrag) {
+        unlistenDrag.then(f => f());
       }
     };
   }, []);
@@ -191,13 +259,22 @@ function App() {
   }, [selectedAppId, apps]);
 
   // 调用后端 launch_app 命令
+  // 调用后端 launch_app 命令
   const handleSelectFile = async () => {
-    const appName = prompt("请输入应用程序名称 (例如: 命令行):");
-    if (!appName) return;
-    const path = prompt("请输入可执行文件绝对路径 (.exe):");
-    if (!path) return;
-
     try {
+      const selected = await openDialog({
+        multiple: false,
+        filters: [{
+          name: 'Executable',
+          extensions: ['exe']
+        }]
+      });
+
+      if (!selected) return;
+
+      const path = selected;
+      const appName = path.split(/[\\/]/).pop().replace(/\.exe$/i, "") || "未命名应用";
+
       setLogs(prev => [
         ...prev,
         { time: getCurrentTime(), type: "system", text: `[控制台] 正在尝试以代理模式拉起: ${appName}...` }
