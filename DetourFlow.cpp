@@ -8,10 +8,8 @@
 #include <mutex>
 #include <string>
 #include <vector>
-#include <iostream>
+#include <new>
 #include <stdarg.h>
-
-#pragma comment(lib, "ws2_32.lib")
 
 // -------------------------------------------------------------------------
 // Global state and thread-safety
@@ -31,9 +29,6 @@ struct ConnectExContext {
     DWORD sendBufferLen = 0;
 };
 
-// Sockets that need handshaking on their first send (for connect/WSAConnect)
-std::unordered_map<SOCKET, ConnectTarget> g_RedirectedSockets;
-
 // Sockets tracking non-blocking state
 std::unordered_map<SOCKET, bool> g_SocketNonBlockingState;
 
@@ -48,8 +43,10 @@ std::unordered_map<uint32_t, std::string> g_FakeIpToDomain;
 std::unordered_set<PADDRINFOW> g_MyAllocatedAddrInfo;
 
 // -------------------------------------------------------------------------
-// Thread-safe Logging (Per-Process Log File)
+// Thread-safe Logging (Per-Process Log File, auto-truncated when file exceeds 2 MB)
 // -------------------------------------------------------------------------
+static const long MAX_LOG_SIZE = 2 * 1024 * 1024; // 2 MB
+
 void Log(const char* format, ...) {
     char buffer[8192];
     va_list args;
@@ -60,7 +57,7 @@ void Log(const char* format, ...) {
 
     OutputDebugStringA(buffer);
 
-    // Append to process-specific log file in the same directory as the DLL to avoid cluttering app folders and hardcoding paths
+    // Append to process-specific log file in the same directory as the DLL
     char filename[MAX_PATH] = { 0 };
     wchar_t dllPathW[MAX_PATH];
     if (GetModuleFileNameW(GetModuleHandleA("DetourFlow.dll"), dllPathW, MAX_PATH) > 0) {
@@ -77,23 +74,49 @@ void Log(const char* format, ...) {
     }
 
     FILE* f = nullptr;
-    if (fopen_s(&f, filename, "a") == 0 && f) {
-        SYSTEMTIME st;
-        GetLocalTime(&st);
-        fprintf(f, "[%02d:%02d:%02d.%03d] %s\n", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, buffer);
-        fclose(f);
+    if (fopen_s(&f, filename, "a+") != 0 || !f) {
+        return;
     }
+
+    // Check file size via ftell; if over limit, truncate (O(1) instead of O(n) line counting)
+    fseek(f, 0, SEEK_END);
+    long fileSize = ftell(f);
+    if (fileSize >= MAX_LOG_SIZE) {
+        if (freopen_s(&f, filename, "w", f) != 0 || !f) {
+            return; // can't reopen — skip logging this line
+        }
+    } else {
+        // ftell in append mode already moved to end; just clear EOF to write
+        clearerr(f);
+    }
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(f, "[%02d:%02d:%02d.%03d] %s\n", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, buffer);
+    fclose(f);
 }
 
 // -------------------------------------------------------------------------
-// Proxy configuration
+// Helper: parse port from env var with safe fallback
 // -------------------------------------------------------------------------
+int GetEnvPortOrDefault(const char* envName, int defaultPort) {
+    char envPort[32];
+    size_t envPortLen = 0;
+    if (getenv_s(&envPortLen, envPort, sizeof(envPort), envName) == 0 && envPortLen > 0) {
+        char* end = nullptr;
+        long val = strtol(envPort, &end, 10);
+        if (end != envPort && val > 0 && val <= 65535) {
+            return (int)val;
+        }
+    }
+    return defaultPort;
+}
+
 sockaddr_in GetProxyAddress4() {
     sockaddr_in proxyAddr = { 0 };
     proxyAddr.sin_family = AF_INET;
     
     std::string host = "127.0.0.1";
-    int port = 7897;
 
     char envHost[256];
     size_t envHostLen = 0;
@@ -101,11 +124,7 @@ sockaddr_in GetProxyAddress4() {
         host = envHost;
     }
 
-    char envPort[32];
-    size_t envPortLen = 0;
-    if (getenv_s(&envPortLen, envPort, sizeof(envPort), "DETOUR_PROXY_PORT") == 0 && envPortLen > 0) {
-        port = std::stoi(envPort);
-    }
+    int port = GetEnvPortOrDefault("DETOUR_PROXY_PORT", 7897);
 
     inet_pton(AF_INET, host.c_str(), &proxyAddr.sin_addr);
     proxyAddr.sin_port = htons(port);
@@ -117,19 +136,17 @@ sockaddr_in6 GetProxyAddress6() {
     proxyAddr.sin6_family = AF_INET6;
     
     std::string host = "::ffff:127.0.0.1"; // IPv4-mapped IPv6 address for local proxy
-    int port = 7897;
+    int port = GetEnvPortOrDefault("DETOUR_PROXY_PORT", 7897);
 
     char envHost[256];
     size_t envHostLen = 0;
     if (getenv_s(&envHostLen, envHost, sizeof(envHost), "DETOUR_PROXY_HOST") == 0 && envHostLen > 0) {
-        // If an IPv4 proxy is provided in env, map it
-        host = "::ffff:" + std::string(envHost);
-    }
-
-    char envPort[32];
-    size_t envPortLen = 0;
-    if (getenv_s(&envPortLen, envPort, sizeof(envPort), "DETOUR_PROXY_PORT") == 0 && envPortLen > 0) {
-        port = std::stoi(envPort);
+        // If the env host contains ':' it's already an IPv6 address — don't add ::ffff: prefix
+        if (strchr(envHost, ':') != nullptr) {
+            host = std::string(envHost);
+        } else {
+            host = "::ffff:" + std::string(envHost);
+        }
     }
 
     inet_pton(AF_INET6, host.c_str(), &proxyAddr.sin6_addr);
@@ -170,6 +187,37 @@ bool IsLocalIPv6(const in6_addr& addr) {
     }
 
     return false;
+}
+
+// -------------------------------------------------------------------------
+// Helper: Parse comma-separated IPv4 list into host-byte-order uint32_t vector
+// -------------------------------------------------------------------------
+std::vector<uint32_t> ParseCsvIpList(const std::string& input) {
+    std::vector<uint32_t> ips;
+    size_t start = 0;
+    size_t end;
+    while ((end = input.find(',', start)) != std::string::npos) {
+        std::string ipStr = input.substr(start, end - start);
+        ipStr.erase(0, ipStr.find_first_not_of(" \t\r\n"));
+        ipStr.erase(ipStr.find_last_not_of(" \t\r\n") + 1);
+        if (!ipStr.empty()) {
+            IN_ADDR addr;
+            if (inet_pton(AF_INET, ipStr.c_str(), &addr) == 1) {
+                ips.push_back(ntohl(addr.s_addr));
+            }
+        }
+        start = end + 1;
+    }
+    std::string ipStr = input.substr(start);
+    ipStr.erase(0, ipStr.find_first_not_of(" \t\r\n"));
+    ipStr.erase(ipStr.find_last_not_of(" \t\r\n") + 1);
+    if (!ipStr.empty()) {
+        IN_ADDR addr;
+        if (inet_pton(AF_INET, ipStr.c_str(), &addr) == 1) {
+            ips.push_back(ntohl(addr.s_addr));
+        }
+    }
+    return ips;
 }
 
 bool ParseTargetAddress(const sockaddr* name, ConnectTarget& target) {
@@ -229,36 +277,13 @@ bool ParseTargetAddress(const sockaddr* name, ConnectTarget& target) {
             }
             std::string bypassPath = dllDir + "\\detour_bypass.txt";
             FILE* f = nullptr;
-            if (fopen_s(&f, bypassPath.c_str(), "r") == 0 && f) {
+            if (fopen_s(&f, bypassPath.c_str(), "r") == 0) {
                 char fileContent[4096] = { 0 };
                 size_t readBytes = fread(fileContent, 1, sizeof(fileContent) - 1, f);
                 fclose(f);
                 if (readBytes > 0) {
                     std::string s(fileContent);
-                    size_t start = 0;
-                    size_t end = s.find(',');
-                    while (end != std::string::npos) {
-                        std::string ipStr = s.substr(start, end - start);
-                        ipStr.erase(0, ipStr.find_first_not_of(" \t\r\n"));
-                        ipStr.erase(ipStr.find_last_not_of(" \t\r\n") + 1);
-                        if (!ipStr.empty()) {
-                            IN_ADDR addr;
-                            if (inet_pton(AF_INET, ipStr.c_str(), &addr) == 1) {
-                                bypassIps.push_back(ntohl(addr.s_addr));
-                            }
-                        }
-                        start = end + 1;
-                        end = s.find(',', start);
-                    }
-                    std::string ipStr = s.substr(start);
-                    ipStr.erase(0, ipStr.find_first_not_of(" \t\r\n"));
-                    ipStr.erase(ipStr.find_last_not_of(" \t\r\n") + 1);
-                    if (!ipStr.empty()) {
-                        IN_ADDR addr;
-                        if (inet_pton(AF_INET, ipStr.c_str(), &addr) == 1) {
-                            bypassIps.push_back(ntohl(addr.s_addr));
-                        }
-                    }
+                    bypassIps = ParseCsvIpList(s);
                     loadedFromFile = true;
                 }
             }
@@ -270,30 +295,7 @@ bool ParseTargetAddress(const sockaddr* name, ConnectTarget& target) {
             size_t envBypassLen = 0;
             if (getenv_s(&envBypassLen, envBypass, sizeof(envBypass), "DETOUR_BYPASS_IPS") == 0 && envBypassLen > 0) {
                 std::string s(envBypass);
-                size_t start = 0;
-                size_t end = s.find(',');
-                while (end != std::string::npos) {
-                    std::string ipStr = s.substr(start, end - start);
-                    ipStr.erase(0, ipStr.find_first_not_of(" \t\r\n"));
-                    ipStr.erase(ipStr.find_last_not_of(" \t\r\n") + 1);
-                    if (!ipStr.empty()) {
-                        IN_ADDR addr;
-                        if (inet_pton(AF_INET, ipStr.c_str(), &addr) == 1) {
-                            bypassIps.push_back(ntohl(addr.s_addr));
-                        }
-                    }
-                    start = end + 1;
-                    end = s.find(',', start);
-                }
-                std::string ipStr = s.substr(start);
-                ipStr.erase(0, ipStr.find_first_not_of(" \t\r\n"));
-                ipStr.erase(ipStr.find_last_not_of(" \t\r\n") + 1);
-                if (!ipStr.empty()) {
-                    IN_ADDR addr;
-                    if (inet_pton(AF_INET, ipStr.c_str(), &addr) == 1) {
-                        bypassIps.push_back(ntohl(addr.s_addr));
-                    }
-                }
+                bypassIps = ParseCsvIpList(s);
             }
         }
 
@@ -384,6 +386,18 @@ bool PerformSocks5Handshake(SOCKET s, const ConnectTarget& target) {
         return false;
     }
 
+    // Save and set socket timeout to prevent indefinite blocking during handshake
+    DWORD origRecvTimeout = 0;
+    DWORD origSendTimeout = 0;
+    int optLen = sizeof(origRecvTimeout);
+    getsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&origRecvTimeout, &optLen);
+    optLen = sizeof(origSendTimeout);
+    getsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char*)&origSendTimeout, &optLen);
+
+    DWORD handshakeTimeout = 10000; // 10 seconds
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&handshakeTimeout, sizeof(handshakeTimeout));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&handshakeTimeout, sizeof(handshakeTimeout));
+
     bool success = false;
     do {
         unsigned char greeting[] = { 0x05, 0x01, 0x00 };
@@ -460,7 +474,7 @@ bool PerformSocks5Handshake(SOCKET s, const ConnectTarget& target) {
             remainingLen = 4 + 2;
         } else if (respHeader[3] == 0x03) {
             unsigned char domainLen = 0;
-            if (recv(s, (char*)&domainLen, 1, 0) != 1) {
+            if (recv(s, (char*)&domainLen, 1, MSG_WAITALL) != 1) {
                 break;
             }
             remainingLen = domainLen + 2;
@@ -479,6 +493,10 @@ bool PerformSocks5Handshake(SOCKET s, const ConnectTarget& target) {
 
         success = true;
     } while (false);
+
+    // Restore original socket timeouts
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&origRecvTimeout, sizeof(origRecvTimeout));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&origSendTimeout, sizeof(origSendTimeout));
 
     bool isNonBlocking = false;
     {
@@ -529,11 +547,16 @@ void CheckAndHandleConnectExCompletion(LPOVERLAPPED lpOverlapped) {
 
         Log("ConnectEx completed asynchronously. Socket %u context updated. Beginning handshake to target %s...", (unsigned int)ctx.s, targetDesc.c_str());
         // Update socket context so that send/recv can be used on it
-        setsockopt(ctx.s, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, NULL, 0);
+        if (setsockopt(ctx.s, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, NULL, 0) != 0) {
+            Log("WARNING: SO_UPDATE_CONNECT_CONTEXT failed on socket %u, error %u", (unsigned int)ctx.s, WSAGetLastError());
+        }
 
         PerformSocks5Handshake(ctx.s, ctx.target);
         if (ctx.sendBuffer && ctx.sendBufferLen > 0) {
-            send(ctx.s, ctx.sendBuffer, ctx.sendBufferLen, 0);
+            int sent = send(ctx.s, ctx.sendBuffer, ctx.sendBufferLen, 0);
+            if (sent < 0 || (DWORD)sent != ctx.sendBufferLen) {
+                Log("WARNING: ConnectEx send buffer only partially sent (%d/%u bytes)", sent, ctx.sendBufferLen);
+            }
             delete[] ctx.sendBuffer;
         }
     }
@@ -760,7 +783,13 @@ BOOL PASCAL FAR HookConnectEx(
     ctx.s = s;
     ctx.target = target;
     if (lpSendBuffer && dwSendDataLength > 0) {
-        ctx.sendBuffer = new char[dwSendDataLength];
+        try {
+            ctx.sendBuffer = new char[dwSendDataLength];
+        } catch (std::bad_alloc&) {
+            Log("ConnectEx: failed to allocate %u bytes for send buffer", dwSendDataLength);
+            WSASetLastError(WSAENOBUFS);
+            return FALSE;
+        }
         memcpy(ctx.sendBuffer, lpSendBuffer, dwSendDataLength);
         ctx.sendBufferLen = dwSendDataLength;
     }
@@ -770,13 +799,52 @@ BOOL PASCAL FAR HookConnectEx(
         g_PendingConnectEx[lpOverlapped] = ctx;
     }
 
+    BOOL connectExResult;
     if (target.addr.ss_family == AF_INET6) {
         sockaddr_in6 proxyAddr = GetProxyAddress6();
-        return TrueConnectEx(s, (const sockaddr*)&proxyAddr, sizeof(proxyAddr), NULL, 0, lpdwBytesSent, lpOverlapped);
+        connectExResult = TrueConnectEx(s, (const sockaddr*)&proxyAddr, sizeof(proxyAddr), NULL, 0, lpdwBytesSent, lpOverlapped);
     } else {
         sockaddr_in proxyAddr = GetProxyAddress4();
-        return TrueConnectEx(s, (const sockaddr*)&proxyAddr, sizeof(proxyAddr), NULL, 0, lpdwBytesSent, lpOverlapped);
+        connectExResult = TrueConnectEx(s, (const sockaddr*)&proxyAddr, sizeof(proxyAddr), NULL, 0, lpdwBytesSent, lpOverlapped);
     }
+
+    // If ConnectEx completes synchronously (TRUE), perform the SOCKS5 handshake immediately.
+    // The async IOCP completion path (CheckAndHandleConnectExCompletion) won't fire.
+    if (connectExResult) {
+        std::lock_guard<std::mutex> lock(g_Mutex);
+        g_PendingConnectEx.erase(lpOverlapped);
+
+        // Update socket context for use after ConnectEx
+        setsockopt(ctx.s, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, NULL, 0);
+
+        if (PerformSocks5Handshake(ctx.s, ctx.target)) {
+            // Forward the captured send buffer through the SOCKS5 tunnel
+            if (ctx.sendBuffer && ctx.sendBufferLen > 0) {
+                int sent = send(ctx.s, ctx.sendBuffer, ctx.sendBufferLen, 0);
+                if (sent < 0 || (DWORD)sent != ctx.sendBufferLen) {
+                    Log("WARNING: ConnectEx sync send buffer only partially sent (%d/%u bytes)", sent, ctx.sendBufferLen);
+                }
+            }
+            if (ctx.sendBuffer) delete[] ctx.sendBuffer;
+            return TRUE;
+        } else {
+            if (ctx.sendBuffer) delete[] ctx.sendBuffer;
+            WSASetLastError(WSAECONNREFUSED);
+            return FALSE;
+        }
+    }
+
+    // If ConnectEx failed synchronously (FALSE + error != WSA_IO_PENDING), clean up —
+    // no IOCP completion will fire for this operation.
+    if (!connectExResult && WSAGetLastError() != WSA_IO_PENDING) {
+        std::lock_guard<std::mutex> lock(g_Mutex);
+        g_PendingConnectEx.erase(lpOverlapped);
+        if (ctx.sendBuffer) {
+            delete[] ctx.sendBuffer;
+        }
+    }
+
+    return connectExResult;
 }
 
 int WSAAPI HookWSAIoctl(
@@ -808,7 +876,6 @@ int WSAAPI HookWSAIoctl(
 int WSAAPI HookClosesocket(SOCKET s) {
     {
         std::lock_guard<std::mutex> lock(g_Mutex);
-        g_RedirectedSockets.erase(s);
         g_SocketNonBlockingState.erase(s);
     }
     return TrueClosesocket(s);
@@ -859,7 +926,22 @@ DWORD AllocateFakeIp(const wchar_t* domainW) {
     WideCharToMultiByte(CP_UTF8, 0, domainW, -1, domainA, sizeof(domainA), NULL, NULL);
 
     std::lock_guard<std::mutex> lock(g_Mutex);
+
+    // Cap the map and let the counter wrap naturally for FIFO-like eviction
+    static const size_t MAX_FAKE_IPS = 10000;
+    if (g_FakeIpToDomain.size() >= MAX_FAKE_IPS) {
+        Log("Fake IP map full (%zu entries). Wrapping to reuse.", MAX_FAKE_IPS);
+        // Move counter past already-occupied range to trigger wrap-based reuse
+        g_NextFakeIp = 0xC6120001;
+    }
+
     DWORD fakeIp = g_NextFakeIp++;
+
+    // Keep within 198.18.0.0/15 detection range (0xC6120000 – 0xC613FFFF)
+    if (g_NextFakeIp > 0xC613FFFF) {
+        g_NextFakeIp = 0xC6120001;
+    }
+
     g_FakeIpToDomain[fakeIp] = domainA;
     return fakeIp;
 }
@@ -889,7 +971,21 @@ INT WSAAPI HookGetAddrInfoW(
         addr->sin_family = AF_INET;
         addr->sin_addr.s_addr = htonl(fakeIp);
         if (pServiceName) {
-            addr->sin_port = htons((USHORT)_wtoi(pServiceName));
+            int port = _wtoi(pServiceName);
+            if (port == 0 && wcscmp(pServiceName, L"0") != 0) {
+                // Named service (e.g., "http" → 80) — resolve it
+                char svc[64];
+                WideCharToMultiByte(CP_UTF8, 0, pServiceName, -1, svc, sizeof(svc), NULL, NULL);
+                struct servent* se = getservbyname(svc, NULL);
+                if (se) {
+                    port = ntohs(se->s_port);
+                } else {
+                    // Unknown service name — can't fake the port, defer to real resolver
+                    HeapFree(GetProcessHeap(), 0, res);
+                    return TrueGetAddrInfoW(pNodeName, pServiceName, pHints, ppResult);
+                }
+            }
+            addr->sin_port = htons((USHORT)port);
         }
 
         {
@@ -988,7 +1084,20 @@ BOOL WINAPI HookCreateProcessW(
     GetModuleFileNameW(GetModuleHandleA("DetourFlow.dll"), dllPathW, MAX_PATH);
 
     char dllPathA[MAX_PATH];
-    WideCharToMultiByte(CP_ACP, 0, dllPathW, -1, dllPathA, MAX_PATH, NULL, NULL);
+    {
+        // Helper: convert DLL wide path to ANSI with short-path fallback
+        auto conv = [&](wchar_t* widePath, char* ansiOut, int ansiMax) -> bool {
+            if (WideCharToMultiByte(CP_ACP, 0, widePath, -1, ansiOut, ansiMax, NULL, NULL) > 0)
+                return true;
+            wchar_t shortPath[MAX_PATH];
+            return GetShortPathNameW(widePath, shortPath, MAX_PATH) > 0 &&
+                   WideCharToMultiByte(CP_ACP, 0, shortPath, -1, ansiOut, ansiMax, NULL, NULL) > 0;
+        };
+        if (!conv(dllPathW, dllPathA, MAX_PATH)) {
+            Log("Failed to convert DLL path to ANSI");
+            return FALSE;
+        }
+    }
 
     BOOL res = DetourCreateProcessWithDllExW(
         lpApplicationName,
@@ -1078,7 +1187,19 @@ BOOL WINAPI HookCreateProcessA(
     GetModuleFileNameW(GetModuleHandleA("DetourFlow.dll"), dllPathW, MAX_PATH);
 
     char dllPathA[MAX_PATH];
-    WideCharToMultiByte(CP_ACP, 0, dllPathW, -1, dllPathA, MAX_PATH, NULL, NULL);
+    {
+        auto conv = [&](wchar_t* widePath, char* ansiOut, int ansiMax) -> bool {
+            if (WideCharToMultiByte(CP_ACP, 0, widePath, -1, ansiOut, ansiMax, NULL, NULL) > 0)
+                return true;
+            wchar_t shortPath[MAX_PATH];
+            return GetShortPathNameW(widePath, shortPath, MAX_PATH) > 0 &&
+                   WideCharToMultiByte(CP_ACP, 0, shortPath, -1, ansiOut, ansiMax, NULL, NULL) > 0;
+        };
+        if (!conv(dllPathW, dllPathA, MAX_PATH)) {
+            Log("Failed to convert DLL path to ANSI");
+            return FALSE;
+        }
+    }
 
     BOOL res = DetourCreateProcessWithDllExA(
         lpApplicationName,
@@ -1172,8 +1293,17 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             return TRUE;
         }
 
-        SetEnvironmentVariableA("no_proxy", "localhost,127.0.0.1,::1");
-        SetEnvironmentVariableA("NO_PROXY", "localhost,127.0.0.1,::1");
+        // Preserve existing no_proxy if set by the user, otherwise use our default
+        {
+            char existing[4096] = {0};
+            size_t len = 0;
+            std::string noProxyVal = "localhost,127.0.0.1,::1";
+            if (getenv_s(&len, existing, sizeof(existing), "no_proxy") == 0 && len > 0) {
+                noProxyVal = std::string(existing) + "," + noProxyVal;
+            }
+            SetEnvironmentVariableA("no_proxy", noProxyVal.c_str());
+            SetEnvironmentVariableA("NO_PROXY", noProxyVal.c_str());
+        }
         Log("DetourFlow DLL Loaded inside process. Set local bypass env (no_proxy/NO_PROXY).");
 
         DetourRestoreAfterWith();
@@ -1202,6 +1332,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 
         DetourTransactionCommit();
         Log("All detours successfully committed.");
+
+        // Check that all function pointers were detoured by verifying at least one hook is active
+        // If TrueConnect still points to the original connect(), the transaction failed silently.
+        // We don't abort here because partial hooks are better than no hooks.
+        if (TrueConnect == connect) {
+            Log("WARNING: DetourTransactionCommit may have failed — TrueConnect unchanged.");
+        }
     } 
     else if (ul_reason_for_call == DLL_PROCESS_DETACH) {
         Log("DetourFlow DLL Detached from process.");
@@ -1238,7 +1375,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             }
         }
         g_PendingConnectEx.clear();
-        g_RedirectedSockets.clear();
         g_SocketNonBlockingState.clear();
 
         for (PADDRINFOW p : g_MyAllocatedAddrInfo) {

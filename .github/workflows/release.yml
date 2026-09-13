@@ -47,6 +47,13 @@ jobs:
         run: npm install
         working-directory: gui
 
+      - name: Copy C++ binaries into Tauri resources
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path gui\src-tauri\resources
+          Copy-Item build\Release\DetourFlow.dll gui\src-tauri\resources\
+          Copy-Item build\Release\DetourLauncher.exe gui\src-tauri\resources\
+
       - name: Build Tauri GUI (NSIS installer + portable)
         run: npm run tauri build
         working-directory: gui
@@ -64,7 +71,8 @@ jobs:
           Copy-Item build\Release\DetourFlow.dll release-pkg\
           Copy-Item build\Release\DetourLauncher.exe release-pkg\
           # GUI exe（便携版，不需要安装）
-          $guiExe = Get-ChildItem "gui\src-tauri\target\release\gui.exe" -ErrorAction SilentlyContinue
+          $guiExe = Get-ChildItem "gui\src-tauri\target\release\DetourFlow.exe" -ErrorAction SilentlyContinue
+          if (-not $guiExe) { $guiExe = Get-ChildItem "gui\src-tauri\target\release\gui.exe" -ErrorAction SilentlyContinue }
           if ($guiExe) { Copy-Item $guiExe.FullName release-pkg\DetourFlow.exe }
           Copy-Item README.md release-pkg\
           Compress-Archive -Path release-pkg\* -DestinationPath DetourFlow-${{ github.ref_name }}-win-x64.zip -Force

@@ -3,3 +3,5 @@ detour_flow_*.log
 .vs/
 *.user
 *.suo
+gui/src-tauri/resources/
+*.zip

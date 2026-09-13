@@ -28,8 +28,16 @@ int wmain(int argc, wchar_t* argv[]) {
     char dllPathA[MAX_PATH];
     int size = WideCharToMultiByte(CP_ACP, 0, dllPath.c_str(), -1, dllPathA, MAX_PATH, NULL, NULL);
     if (size <= 0) {
-        printf("错误: 无法解析 DLL 路径格式\n");
-        return 1;
+        // CP_ACP 转换失败时尝试短路径（解决 Unicode 路径在非中文系统的乱码问题）
+        wchar_t shortPath[MAX_PATH];
+        DWORD shortLen = GetShortPathNameW(dllPath.c_str(), shortPath, MAX_PATH);
+        if (shortLen > 0 && shortLen < MAX_PATH) {
+            size = WideCharToMultiByte(CP_ACP, 0, shortPath, -1, dllPathA, MAX_PATH, NULL, NULL);
+        }
+        if (size <= 0) {
+            printf("错误: 无法解析 DLL 路径格式\n");
+            return 1;
+        }
     }
 
     // 检查 DLL 文件是否存在
@@ -54,21 +62,34 @@ int wmain(int argc, wchar_t* argv[]) {
     wprintf(L"[*] 命令行参数: %s\n", commandLine.c_str());
     printf("[*] 注入 DLL 路径: %s\n", dllPathA);
 
-    // 3. 使用 Detours 创建注入进程
+    // 3. 解析目标程序所在目录作为工作目录，防止依赖自身资源的程序启动失败
+    std::wstring targetExe = argv[1];
+    std::wstring targetDir = L"";
+    size_t targetSlash = targetExe.find_last_of(L"\\/");
+    if (targetSlash != std::wstring::npos) {
+        targetDir = targetExe.substr(0, targetSlash);
+    }
+    if (!targetDir.empty()) {
+        wprintf(L"[*] 工作目录: %s\n", targetDir.c_str());
+    }
+
+    // 4. 使用 Detours 创建注入进程
     STARTUPINFOW sInfo = { 0 };
     sInfo.cb = sizeof(sInfo);
     PROCESS_INFORMATION pInfo = { 0 };
 
     // 使用 DetourCreateProcessWithDllExW 启动挂起并注入
+    // DetourCreateProcessWithDllExW takes LPWSTR (may modify it per CreateProcessW contract),
+    // so we use the mutable buffer from std::wstring (&commandLine[0]) instead of const_cast.
     BOOL success = DetourCreateProcessWithDllExW(
         NULL,
-        const_cast<LPWSTR>(commandLine.c_str()),
+        &commandLine[0],
         NULL,
         NULL,
         TRUE,
         CREATE_DEFAULT_ERROR_MODE,
         NULL,
-        NULL,
+        targetDir.empty() ? NULL : targetDir.c_str(),
         &sInfo,
         &pInfo,
         dllPathA,
@@ -82,8 +103,10 @@ int wmain(int argc, wchar_t* argv[]) {
     }
 
     printf("[+] 目标进程启动成功。PID: %lu\n", pInfo.dwProcessId);
+    printf("[DETOUR_TARGET_PID] %lu\n", pInfo.dwProcessId);
+    fflush(stdout);
 
-    // 4. 等待进程退出并获取退出码
+    // 5. 等待进程退出并获取退出码
     WaitForSingleObject(pInfo.hProcess, INFINITE);
     DWORD exitCode = 0;
     GetExitCodeProcess(pInfo.hProcess, &exitCode);
@@ -91,6 +114,6 @@ int wmain(int argc, wchar_t* argv[]) {
     CloseHandle(pInfo.hProcess);
     CloseHandle(pInfo.hThread);
 
-    printf("[+] 目标进程已退出，退出码: %lu\n", exitCode);
-    return exitCode;
+    wprintf(L"[*] 目标进程 (PID: %lu) 已退出，退出码: %lu\n", pInfo.dwProcessId, exitCode);
+    return (int)exitCode;
 }
